@@ -31,8 +31,10 @@ class AudioAnalysis:
             existing = db.execute("SELECT id FROM analyses WHERE fingerprint=?", (fingerprint,)).fetchone()
             if existing:
                 return self.get(existing["id"], db)
+        # Each request keeps its own settings on the stack; a shared attribute
+        # would let concurrent measurements of different specs overwrite each
+        # other's silence thresholds and bucket counts mid-run.
         job = self.db.begin_derivation(asset_id, kind, settings)
-        self._active_settings = dict(settings)
         try:
             if kind == "loudness":
                 result = self.measure_loudness(asset)
@@ -40,7 +42,6 @@ class AudioAnalysis:
             rate = 16000
             with self.blobs.temporary(".pcm") as pcm:
                 self.processes.decode_audio(self.blobs.resolve(asset["blob"], verify=True), pcm, rate)
-                settings = dict(self._active_settings)
                 samples = read_pcm(pcm)
                 require(len(samples) > 0, "empty_audio", "Decoded audio is empty")
                 if kind == "signal":

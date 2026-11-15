@@ -1,3 +1,4 @@
+import json
 from .errors import require
 from .values import object_body, integer
 from .timebase import seconds
@@ -7,6 +8,23 @@ class Frames:
     def __init__(self, assets, blobs, processes, artifacts):
         self.assets, self.blobs = assets, blobs
         self.processes, self.artifacts = processes, artifacts
+
+    def find_sheet(self, asset_id, descriptor):
+        """Return an existing, fully committed sheet for the same layout.
+
+        Reuse is based on the published artifact rows only, never on an
+        in-progress derivation run, so a half-finished request can never be
+        handed back as a completed contact sheet.
+        """
+        with self.artifacts.db.read() as db:
+            rows = db.execute(
+                "SELECT * FROM artifacts WHERE asset=? AND kind='contact_sheet' ORDER BY created DESC,id DESC",
+                (asset_id,)).fetchall()
+            for row in rows:
+                metadata = json.loads(row["metadata"])
+                if all(metadata.get(field) == value for field, value in descriptor.items()):
+                    return self.artifacts.get(row["id"], db)
+        return None
 
     def contact_sheet(self, asset_id, raw):
         object_body(raw, ("count", "columns", "cell_width"))
@@ -20,9 +38,14 @@ class Frames:
         rows = (count+columns-1)//columns
         interval = duration/count
         timestamps = [round((i+.5)*interval, 6) for i in range(count)]
+        # The descriptor stays local to this request. A shared attribute would
+        # let concurrent sheets of different layouts swap each other's frame
+        # counts and sampling times while ffmpeg is running.
         descriptor = {"count": count, "columns": columns, "rows": rows,
                       "cell_width": cell_width, "sample_seconds": timestamps}
-        self._frame_request = descriptor
+        cached = self.find_sheet(asset_id, descriptor)
+        if cached is not None:
+            return cached
         job = self.artifacts.db.begin_derivation(asset_id, "contact_sheet", descriptor)
         try:
             with self.blobs.temporary(".jpg") as output:
@@ -31,10 +54,8 @@ class Frames:
                 self.processes.run(["-protocol_whitelist", "file,pipe", "-i", str(self.blobs.resolve(asset["blob"])),
                                     "-an", "-vf", filter_spec, "-frames:v", "1", "-q:v", "3", str(output)])
                 require(output.is_file(), "empty_sheet", "No video frames were decoded")
-                layout = dict(self._frame_request)
                 result = self.artifacts.add(asset_id, "contact_sheet", output,
-                                          {"count": layout["count"], "columns": layout["columns"], "rows": layout["rows"],
-                                           "cell_width": layout["cell_width"], "sample_seconds": layout["sample_seconds"],
+                                          {**descriptor,
                                            "source_blob": asset["blob"], "mime": "image/jpeg"})
                 return self.artifacts.db.finish_derivation(job, result)
         except BaseException:
